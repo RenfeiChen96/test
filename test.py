@@ -12,3 +12,25 @@ class Test:
         """
         FUNC_DOC_STRING
         """
+
+    def test(self) -> None:
+        """
+        TEST_DOC_STRING
+        """
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
+        self.func_name()
