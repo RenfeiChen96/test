@@ -568,13 +568,13 @@ class KernelBuilder:
         body: list[tuple[Engine, tuple]] = []
 
         tiles = batch_size // VLEN
-        # Per-tile scratch
-        tile_data = []
-        for t in range(tiles):
-            base_i = t * VLEN
-            batch_it = self.alloc_scratch(f"batch_i_{t}")
-            self.add("load", ("const", batch_it, base_i))
+        # Limit concurrent tiles to fit scratch; reuse these across groups
+        MAX_CONCURRENT_TILES = min(16, tiles)
 
+        # Allocate per-concurrent-tile scratch once
+        tile_data = []
+        for t in range(MAX_CONCURRENT_TILES):
+            batch_it = self.alloc_scratch(f"batch_i_{t}")
             addr_idx = self.alloc_scratch(f"addr_idx_{t}")
             addr_val = self.alloc_scratch(f"addr_val_{t}")
 
@@ -587,41 +587,52 @@ class KernelBuilder:
             tile_data.append((batch_it, addr_idx, addr_val, v_idx, v_val, v_addr, v_node, vtmp1, vtmp2))
 
         for round_i in range(rounds):
-            for t in range(tiles):
-                batch_it, addr_idx, addr_val, v_idx, v_val, v_addr, v_node, vtmp1, vtmp2 = tile_data[t]
-                # Addresses and loads
-                body.append(("alu", ("+", addr_idx, self.scratch["inp_indices_p"], batch_it)))
-                body.append(("load", ("vload", v_idx, addr_idx)))
-                body.append(("alu", ("+", addr_val, self.scratch["inp_values_p"], batch_it)))
-                body.append(("load", ("vload", v_val, addr_val)))
+            for group_start in range(0, tiles, MAX_CONCURRENT_TILES):
+                group_count = min(MAX_CONCURRENT_TILES, tiles - group_start)
 
-                # Compute gather addresses and gather
-                body.append(("valu", ("+", v_addr, vforest_base, v_idx)))
-                for vi in range(VLEN):
-                    body.append(("load", ("load_offset", v_node, v_addr, vi)))
+                # Set batch offsets for this group
+                for local_t in range(group_count):
+                    global_t = group_start + local_t
+                    base_i = global_t * VLEN
+                    batch_it, *_ = tile_data[local_t]
+                    body.append(("load", ("const", batch_it, base_i)))
 
-                # Mix node value into hash input
-                body.append(("valu", ("^", v_val, v_val, v_node)))
+                for local_t in range(group_count):
+                    batch_it, addr_idx, addr_val, v_idx, v_val, v_addr, v_node, vtmp1, vtmp2 = tile_data[local_t]
 
-                # Hash rounds with pre-broadcast constants
-                for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
-                    body.append(("valu", (op1, vtmp1, v_val, vhash1[hi])))
-                    body.append(("valu", (op3, vtmp2, v_val, vhash3[hi])))
-                    body.append(("valu", (op2, v_val, vtmp1, vtmp2)))
+                    # Addresses and loads
+                    body.append(("alu", ("+", addr_idx, self.scratch["inp_indices_p"], batch_it)))
+                    body.append(("load", ("vload", v_idx, addr_idx)))
+                    body.append(("alu", ("+", addr_val, self.scratch["inp_values_p"], batch_it)))
+                    body.append(("load", ("vload", v_val, addr_val)))
 
-                # Next index: idx = (idx<<1) + (1 + (val & 1))
-                body.append(("valu", ("&", vtmp1, v_val, vone)))       # parity
-                body.append(("valu", ("+", vtmp2, vone, vtmp1)))       # addend 1/2
-                body.append(("valu", ("<<", v_idx, v_idx, vone)))      # idx<<1
-                body.append(("valu", ("+", v_idx, v_idx, vtmp2)))      # add addend
+                    # Compute gather addresses and gather
+                    body.append(("valu", ("+", v_addr, vforest_base, v_idx)))
+                    for vi in range(VLEN):
+                        body.append(("load", ("load_offset", v_node, v_addr, vi)))
 
-                # Wrap: keep idx if idx < n_nodes else 0
-                body.append(("valu", ("<", vtmp1, v_idx, vn_nodes)))
-                body.append(("flow", ("vselect", v_idx, vtmp1, v_idx, vzero)))
+                    # Mix node value into hash input
+                    body.append(("valu", ("^", v_val, v_val, v_node)))
 
-                # Stores
-                body.append(("store", ("vstore", addr_idx, v_idx)))
-                body.append(("store", ("vstore", addr_val, v_val)))
+                    # Hash rounds with pre-broadcast constants
+                    for hi, (op1, _val1, op2, op3, _val3) in enumerate(HASH_STAGES):
+                        body.append(("valu", (op1, vtmp1, v_val, vhash1[hi])))
+                        body.append(("valu", (op3, vtmp2, v_val, vhash3[hi])))
+                        body.append(("valu", (op2, v_val, vtmp1, vtmp2)))
+
+                    # Next index: idx = (idx<<1) + (1 + (val & 1))
+                    body.append(("valu", ("&", vtmp1, v_val, vone)))       # parity
+                    body.append(("valu", ("+", vtmp2, vone, vtmp1)))       # addend 1/2
+                    body.append(("valu", ("<<", v_idx, v_idx, vone)))      # idx<<1
+                    body.append(("valu", ("+", v_idx, v_idx, vtmp2)))      # add addend
+
+                    # Wrap: keep idx if idx < n_nodes else 0
+                    body.append(("valu", ("<", vtmp1, v_idx, vn_nodes)))
+                    body.append(("flow", ("vselect", v_idx, vtmp1, v_idx, vzero)))
+
+                    # Stores
+                    body.append(("store", ("vstore", addr_idx, v_idx)))
+                    body.append(("store", ("vstore", addr_val, v_val)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
